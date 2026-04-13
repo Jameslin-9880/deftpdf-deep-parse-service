@@ -1,0 +1,16 @@
+[Unit]
+Description=DeftPDF Deep Parse Service
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/deftpdf-deep-parse
+WorkingDirectory=/opt/deftpdf-deep-parse
+ExecStart=/opt/deftpdf-deep-parse/scripts/start-service.sh
+Restart=always
+RestartSec=5
+User=deftpdf
+Group=deftpdf
+
+[Install]
+WantedBy=multi-user.target
