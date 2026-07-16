@@ -24,7 +24,7 @@ EXPECTED_SHA="${EXPECTED_SHA:-${2:-}}"
 APP_ROOT="${APP_ROOT:-/opt/deftpdf-deep-parse}"
 STATE_ROOT="${STATE_ROOT:-/var/lib/deftpdf-deep-parse}"
 SERVICE_NAME="${SERVICE_NAME:-deftpdf-deep-parse.service}"
-KEEP_RELEASES="${KEEP_RELEASES:-5}"
+KEEP_RELEASES="${KEEP_RELEASES:-3}"
 REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp}"
 SSH_KEY="${SSH_KEY:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -86,6 +86,8 @@ UNIT_PATH="/etc/systemd/system/\$SERVICE_NAME"
 ENV_PATH="/etc/default/deftpdf-deep-parse"
 UNIT_BACKUP="\$APP_ROOT/.unit-before-\$RELEASE_ID"
 PREVIOUS_CURRENT=""
+HAD_UNIT=0
+WAS_ENABLED=0
 
 mkdir -p "\$RELEASES_DIR" "\$STATE_ROOT/output"
 if [ -L "\$CURRENT_LINK" ]; then
@@ -93,6 +95,10 @@ if [ -L "\$CURRENT_LINK" ]; then
 fi
 if [ -f "\$UNIT_PATH" ]; then
   cp "\$UNIT_PATH" "\$UNIT_BACKUP"
+  HAD_UNIT=1
+fi
+if systemctl is-enabled --quiet "\$SERVICE_NAME" 2>/dev/null; then
+  WAS_ENABLED=1
 fi
 
 rollback() {
@@ -107,10 +113,18 @@ rollback() {
   else
     rm -f "\$CURRENT_LINK"
   fi
-  if [ -f "\$UNIT_BACKUP" ]; then
+  if [ "\$HAD_UNIT" -eq 1 ] && [ -f "\$UNIT_BACKUP" ]; then
     cp "\$UNIT_BACKUP" "\$UNIT_PATH"
+  else
+    systemctl disable "\$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "\$UNIT_PATH"
   fi
   systemctl daemon-reload || true
+  if [ "\$WAS_ENABLED" -eq 1 ]; then
+    systemctl enable "\$SERVICE_NAME" >/dev/null 2>&1 || true
+  else
+    systemctl disable "\$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
   systemctl restart "\$SERVICE_NAME" || true
   rm -rf "\$RELEASE_DIR"
   rm -f "\$REMOTE_ARTIFACT"
@@ -129,10 +143,9 @@ if [ ! -f "\$ENV_PATH" ]; then
   install -o root -g root -m 0600 "\$RELEASE_DIR/.env.example" "\$ENV_PATH"
 fi
 
-if [ ! -x "\$APP_ROOT/.venv/bin/python" ]; then
-  runuser -u deftpdf -- "\$PYTHON_BIN" -m venv "\$APP_ROOT/.venv"
-fi
-runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install --upgrade pip
+VENV_DIR="\$RELEASE_DIR/.venv"
+runuser -u deftpdf -- "\$PYTHON_BIN" -m venv "\$VENV_DIR"
+runuser -u deftpdf -- "\$VENV_DIR/bin/python" -m pip install --upgrade pip
 CPU_ONLY="\$(grep -E '^DEEP_PARSE_CPU_ONLY=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
 CPU_ONLY="\${CPU_ONLY:-true}"
 if printf '%s' "\$CPU_ONLY" | grep -Eiq '^(1|true|yes|on)$'; then
@@ -140,16 +153,26 @@ if printf '%s' "\$CPU_ONLY" | grep -Eiq '^(1|true|yes|on)$'; then
   TORCHVISION_VERSION="\$(grep -E '^DEEP_PARSE_TORCHVISION_VERSION=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
   TORCH_VERSION="\${TORCH_VERSION:-2.11.0}"
   TORCHVISION_VERSION="\${TORCHVISION_VERSION:-0.26.0}"
-  runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install \
+  runuser -u deftpdf -- "\$VENV_DIR/bin/python" -m pip install \
     --index-url https://download.pytorch.org/whl/cpu \
     "torch==\$TORCH_VERSION" \
     "torchvision==\$TORCHVISION_VERSION"
 fi
-runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install -r "\$RELEASE_DIR/requirements.txt"
+runuser -u deftpdf -- "\$VENV_DIR/bin/python" -m pip install -r "\$RELEASE_DIR/requirements.txt"
+
+LEGACY_MODEL_DIR="\$APP_ROOT/.cache/modelscope/hub/models/OpenDataLab/PDF-Extract-Kit-1___0"
+CURRENT_MODEL_PARENT="\$APP_ROOT/.cache/modelscope/models/OpenDataLab--PDF-Extract-Kit-1.0/snapshots"
+CURRENT_MODEL_DIR="\$CURRENT_MODEL_PARENT/master"
+if [ -d "\$LEGACY_MODEL_DIR" ] && [ ! -e "\$CURRENT_MODEL_DIR" ]; then
+  install -d -o deftpdf -g deftpdf "\$CURRENT_MODEL_PARENT"
+  ln -s "\$LEGACY_MODEL_DIR" "\$CURRENT_MODEL_DIR"
+  chown -h deftpdf:deftpdf "\$CURRENT_MODEL_DIR"
+fi
 
 ln -sfn "\$RELEASE_DIR" "\$CURRENT_LINK"
 install -o root -g root -m 0644 "\$RELEASE_DIR/systemd/deftpdf-deep-parse.service" "\$UNIT_PATH"
 systemctl daemon-reload
+systemctl enable "\$SERVICE_NAME"
 systemctl restart "\$SERVICE_NAME"
 
 healthy=0

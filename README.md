@@ -40,7 +40,13 @@ This repo does not re-implement MinerU. It provides:
 the API process restarts. If the service stops during parsing, the interrupted
 task is returned to the queue and retried. If a task exceeds the hard timeout,
 the entire MinerU worker process group is terminated before a fresh worker is
-started.
+started. Unexpected worker crashes are retried at most
+`DEEP_PARSE_MAX_WORKER_ATTEMPTS` times for the same task; a repeated crash is
+recorded as `WORKER_CRASH_LOOP` so later queued documents can continue.
+
+`POST /tasks` accepts an optional 64-character hexadecimal `idempotency_key`.
+Repeating a submission with the same key returns the original task instead of
+creating duplicate parser work.
 
 ## Local setup
 
@@ -100,8 +106,9 @@ SSH_KEY=/path/to/id_ed25519 \
 ```
 
 The script refuses a dirty checkout or a SHA mismatch, installs dependencies
-into the shared virtualenv, atomically switches `current`, restarts systemd,
-and rolls back automatically unless `/health` confirms persistent task mode.
+into the new immutable release's virtualenv, atomically switches `current`,
+enables and restarts systemd, and rolls back code, unit, and dependencies
+automatically unless `/health` confirms persistent task mode.
 Fresh Linux installs explicitly use PyTorch's CPU wheel index so a CPU parser
 host never downloads CUDA runtime packages by accident.
 

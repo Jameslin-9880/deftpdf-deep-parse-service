@@ -23,6 +23,7 @@ def utc_now_iso() -> str:
 @dataclass(frozen=True)
 class TaskRecord:
     task_id: str
+    idempotency_key: str | None
     status: str
     backend: str
     file_names: list[str]
@@ -69,6 +70,7 @@ class TaskStore:
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT,
                     status TEXT NOT NULL,
                     backend TEXT NOT NULL,
                     file_names_json TEXT NOT NULL,
@@ -94,11 +96,27 @@ class TaskStore:
                     ON tasks(status, completed_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "idempotency_key" not in columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN idempotency_key TEXT"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_key
+                    ON tasks(idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                """
+            )
 
     def create_task(
         self,
         *,
         task_id: str,
+        idempotency_key: str | None = None,
         backend: str,
         file_names: list[str],
         output_dir: str,
@@ -107,6 +125,7 @@ class TaskStore:
         uploads: list[str],
     ) -> TaskRecord:
         created_at = utc_now_iso()
+        created = False
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             next_order = int(
@@ -114,32 +133,52 @@ class TaskStore:
                     "SELECT COALESCE(MAX(submit_order), 0) + 1 FROM tasks"
                 ).fetchone()[0]
             )
-            connection.execute(
-                """
-                INSERT INTO tasks (
-                    task_id, status, backend, file_names_json, created_at,
-                    output_dir, options_json, upload_names_json, uploads_json,
-                    submit_order
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    TASK_PENDING,
-                    backend,
-                    json.dumps(file_names, ensure_ascii=False),
-                    created_at,
-                    output_dir,
-                    json.dumps(options, ensure_ascii=False),
-                    json.dumps(upload_names, ensure_ascii=False),
-                    json.dumps(uploads, ensure_ascii=False),
-                    next_order,
-                ),
-            )
-            connection.execute("COMMIT")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_id, idempotency_key, status, backend,
+                        file_names_json, created_at, output_dir, options_json,
+                        upload_names_json, uploads_json, submit_order
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        idempotency_key,
+                        TASK_PENDING,
+                        backend,
+                        json.dumps(file_names, ensure_ascii=False),
+                        created_at,
+                        output_dir,
+                        json.dumps(options, ensure_ascii=False),
+                        json.dumps(upload_names, ensure_ascii=False),
+                        json.dumps(uploads, ensure_ascii=False),
+                        next_order,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                connection.execute("ROLLBACK")
+            else:
+                connection.execute("COMMIT")
+                created = True
+        if not created and idempotency_key:
+            existing = self.get_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return existing
+        if not created:
+            raise RuntimeError("Failed to persist Deep Parse task")
         record = self.get(task_id)
         if record is None:
             raise RuntimeError("Failed to persist Deep Parse task")
         return record
+
+    def get_by_idempotency_key(self, idempotency_key: str) -> TaskRecord | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return self._record(row) if row is not None else None
 
     def get(self, task_id: str) -> TaskRecord | None:
         with self.connection() as connection:
@@ -249,6 +288,58 @@ class TaskStore:
             )
             return int(cursor.rowcount)
 
+    def recover_processing_tasks_after_crash(
+        self,
+        reason: str,
+        max_attempts: int,
+    ) -> tuple[int, int]:
+        max_attempts = max(1, int(max_attempts))
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            failed = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?,
+                    completed_at = ?,
+                    error = ?,
+                    error_code = 'WORKER_CRASH_LOOP',
+                    worker_pid = NULL,
+                    recovery_count = recovery_count + 1
+                WHERE status = ?
+                  AND attempt_count >= ?
+                """,
+                (
+                    TASK_FAILED,
+                    utc_now_iso(),
+                    (
+                        "MinerU worker exited repeatedly while processing this "
+                        "document."
+                    ),
+                    TASK_PROCESSING,
+                    max_attempts,
+                ),
+            )
+            recovered = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error = ?,
+                    error_code = 'WORKER_RECOVERED',
+                    worker_pid = NULL,
+                    recovery_count = recovery_count + 1
+                WHERE status = ?
+                """,
+                (
+                    TASK_PENDING,
+                    reason[:4000],
+                    TASK_PROCESSING,
+                ),
+            )
+            connection.execute("COMMIT")
+        return int(recovered.rowcount), int(failed.rowcount)
+
     def queued_ahead(self, task: TaskRecord) -> int:
         if task.status != TASK_PENDING:
             return 0
@@ -330,6 +421,11 @@ class TaskStore:
     def _record(row: sqlite3.Row) -> TaskRecord:
         return TaskRecord(
             task_id=str(row["task_id"]),
+            idempotency_key=(
+                str(row["idempotency_key"])
+                if "idempotency_key" in row.keys() and row["idempotency_key"]
+                else None
+            ),
             status=str(row["status"]),
             backend=str(row["backend"]),
             file_names=list(json.loads(str(row["file_names_json"]))),

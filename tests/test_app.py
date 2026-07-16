@@ -5,7 +5,7 @@ import zipfile
 from fastapi.testclient import TestClient
 
 from deftpdf_deep_parse.app import ServiceRuntime, create_app
-from deftpdf_deep_parse.store import TaskStore
+from deftpdf_deep_parse.store import TASK_PENDING, TaskStore
 
 
 def test_health_reports_persistent_task_runtime(tmp_path: Path):
@@ -108,3 +108,34 @@ def test_submit_and_download_completed_zip(tmp_path: Path):
     with zipfile.ZipFile(BytesIO(result.content)) as archive:
         assert archive.namelist() == ["source/auto/source.md"]
         assert archive.read("source/auto/source.md") == b"# converted\n"
+
+
+def test_duplicate_submission_returns_same_task(tmp_path: Path):
+    runtime = ServiceRuntime(
+        str(tmp_path / "tasks.sqlite3"),
+        worker_enabled=False,
+        output_root=str(tmp_path / "output"),
+    )
+    form = {
+        "backend": "pipeline",
+        "parse_method": "auto",
+        "return_md": "true",
+        "response_format_zip": "true",
+        "idempotency_key": "b" * 64,
+    }
+    upload = {
+        "files": (
+            "source.pdf",
+            b"%PDF-1.4\n%%EOF\n",
+            "application/pdf",
+        ),
+    }
+
+    with TestClient(create_app(runtime)) as client:
+        first = client.post("/tasks", data=form, files=upload)
+        second = client.post("/tasks", data=form, files=upload)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert runtime.store.counts()[TASK_PENDING] == 1

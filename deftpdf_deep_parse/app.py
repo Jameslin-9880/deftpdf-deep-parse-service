@@ -190,6 +190,11 @@ class ServiceRuntime:
             7200,
             minimum=300,
         )
+        self.max_worker_attempts = _env_int(
+            "DEEP_PARSE_MAX_WORKER_ATTEMPTS",
+            3,
+            minimum=1,
+        )
         self.task_retention_seconds = _env_int(
             "MINERU_API_TASK_RETENTION_SECONDS",
             86400,
@@ -205,11 +210,15 @@ class ServiceRuntime:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.output_root = self.output_root.resolve()
         self.store.initialize()
-        recovered = self.store.recover_processing_tasks(
-            "Deep Parse service restarted before the worker finished"
+        recovered, failed = self.store.recover_processing_tasks_after_crash(
+            "Deep Parse service restarted after an interrupted worker",
+            self.max_worker_attempts,
         )
-        if recovered:
-            self.last_worker_error = f"Recovered {recovered} interrupted task(s)"
+        if recovered or failed:
+            self.last_worker_error = (
+                f"Recovered {recovered} interrupted task(s); "
+                f"failed {failed} crash-loop task(s)"
+            )
         self.stopping = False
         if self.worker_enabled:
             self._spawn_worker()
@@ -289,7 +298,17 @@ class ServiceRuntime:
                         f"Worker exited unexpectedly with code {exit_code}"
                     )
                     self._stop_worker()
-                    self.store.recover_processing_tasks(self.last_worker_error)
+                    recovered, failed = (
+                        self.store.recover_processing_tasks_after_crash(
+                            self.last_worker_error,
+                            self.max_worker_attempts,
+                        )
+                    )
+                    if failed:
+                        self.last_worker_error += (
+                            f"; failed {failed} task(s) after "
+                            f"{self.max_worker_attempts} worker attempts"
+                        )
                     self._spawn_worker()
                     continue
 
@@ -535,11 +554,29 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
         return_original_file: Annotated[bool, Form()] = False,
         start_page_id: Annotated[int, Form()] = 0,
         end_page_id: Annotated[int, Form()] = 99999,
+        idempotency_key: Annotated[str | None, Form()] = None,
     ) -> tuple[TaskRecord, dict[str, Any]]:
         if not files:
             raise HTTPException(status_code=400, detail="No files were uploaded")
         if parse_method not in ALLOWED_PARSE_METHODS:
             raise HTTPException(status_code=400, detail="Invalid parse_method")
+        normalized_idempotency_key = (
+            str(idempotency_key).strip().lower() if idempotency_key else ""
+        )
+        if normalized_idempotency_key and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            normalized_idempotency_key,
+        ):
+            raise HTTPException(status_code=400, detail="Invalid idempotency_key")
+        if normalized_idempotency_key:
+            existing = service_runtime.store.get_by_idempotency_key(
+                normalized_idempotency_key
+            )
+            if existing is not None:
+                return (
+                    existing,
+                    _task_payload(existing, request, service_runtime),
+                )
         task_id = str(uuid.uuid4())
         task_dir = service_runtime.output_root / task_id
         original_names, file_names, upload_paths = await _save_uploads(task_dir, files)
@@ -563,6 +600,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
         try:
             task = service_runtime.store.create_task(
                 task_id=task_id,
+                idempotency_key=normalized_idempotency_key or None,
                 backend=backend,
                 file_names=file_names,
                 output_dir=str(task_dir),
@@ -573,6 +611,8 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
         except Exception:
             shutil.rmtree(task_dir, ignore_errors=True)
             raise
+        if task.task_id != task_id:
+            shutil.rmtree(task_dir, ignore_errors=True)
         return task, _task_payload(task, request, service_runtime)
 
     @api.post("/tasks", status_code=202)
@@ -594,6 +634,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
         return_original_file: Annotated[bool, Form()] = False,
         start_page_id: Annotated[int, Form()] = 0,
         end_page_id: Annotated[int, Form()] = 99999,
+        idempotency_key: Annotated[str | None, Form()] = None,
     ):
         task, payload = await submit_task(
             request,
@@ -613,6 +654,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
             return_original_file,
             start_page_id,
             end_page_id,
+            idempotency_key,
         )
         payload["message"] = "Task submitted successfully"
         return JSONResponse(status_code=202, content=payload)
@@ -637,6 +679,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
         return_original_file: Annotated[bool, Form()] = False,
         start_page_id: Annotated[int, Form()] = 0,
         end_page_id: Annotated[int, Form()] = 99999,
+        idempotency_key: Annotated[str | None, Form()] = None,
     ):
         task, _payload = await submit_task(
             request,
@@ -656,6 +699,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
             return_original_file,
             start_page_id,
             end_page_id,
+            idempotency_key,
         )
         while True:
             await asyncio.sleep(1)
@@ -731,6 +775,7 @@ def create_app(runtime: ServiceRuntime | None = None) -> FastAPI:
             "max_concurrent_requests": 1,
             "worker_pid": service_runtime.worker_pid(),
             "max_task_runtime_seconds": service_runtime.max_task_runtime_seconds,
+            "max_worker_attempts": service_runtime.max_worker_attempts,
             "task_retention_seconds": service_runtime.task_retention_seconds,
             "task_cleanup_interval_seconds": service_runtime.cleanup_interval_seconds,
             "last_worker_error": service_runtime.last_worker_error,
