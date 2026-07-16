@@ -136,8 +136,8 @@ runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install --upgrade pip
 CPU_ONLY="\$(grep -E '^DEEP_PARSE_CPU_ONLY=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
 CPU_ONLY="\${CPU_ONLY:-true}"
 if printf '%s' "\$CPU_ONLY" | grep -Eiq '^(1|true|yes|on)$'; then
-  TORCH_VERSION="\$(grep -E '^DEEP_PARSE_TORCH_VERSION=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2-)"
-  TORCHVISION_VERSION="\$(grep -E '^DEEP_PARSE_TORCHVISION_VERSION=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2-)"
+  TORCH_VERSION="\$(grep -E '^DEEP_PARSE_TORCH_VERSION=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
+  TORCHVISION_VERSION="\$(grep -E '^DEEP_PARSE_TORCHVISION_VERSION=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
   TORCH_VERSION="\${TORCH_VERSION:-2.11.0}"
   TORCHVISION_VERSION="\${TORCHVISION_VERSION:-0.26.0}"
   runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install \
