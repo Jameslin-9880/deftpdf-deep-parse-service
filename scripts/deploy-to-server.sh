@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+  local level="$1"
+  shift
+  printf '[%s] %s\n' "$level" "$*"
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+escape_shell() {
+  printf '%q' "$1"
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DEPLOY_HOST="${DEPLOY_HOST:-${1:-}}"
+EXPECTED_SHA="${EXPECTED_SHA:-${2:-}}"
+APP_ROOT="${APP_ROOT:-/opt/deftpdf-deep-parse}"
+STATE_ROOT="${STATE_ROOT:-/var/lib/deftpdf-deep-parse}"
+SERVICE_NAME="${SERVICE_NAME:-deftpdf-deep-parse.service}"
+KEEP_RELEASES="${KEEP_RELEASES:-5}"
+REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp}"
+SSH_KEY="${SSH_KEY:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+[ -n "$DEPLOY_HOST" ] || die "Deploy host is required."
+
+CURRENT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" != "$CURRENT_SHA" ]; then
+  die "Checkout SHA $CURRENT_SHA does not match expected SHA $EXPECTED_SHA."
+fi
+EXPECTED_SHA="$CURRENT_SHA"
+
+if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+  die "Refusing to deploy a dirty checkout."
+fi
+
+SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short=12 "$EXPECTED_SHA")"
+RELEASE_ID="$(date -u +%Y%m%d_%H%M%S)-$SHORT_SHA"
+ARTIFACT="$(mktemp "${TMPDIR:-/tmp}/deftpdf-deep-parse.XXXXXX.tar.gz")"
+REMOTE_ARTIFACT="$REMOTE_TMP_DIR/deftpdf-deep-parse-$RELEASE_ID.tar.gz"
+
+cleanup() {
+  rm -f "$ARTIFACT"
+}
+trap cleanup EXIT
+
+git -C "$REPO_ROOT" archive --format=tar.gz --output="$ARTIFACT" "$EXPECTED_SHA"
+
+SSH_OPTIONS=(
+  -o BatchMode=yes
+  -o IdentitiesOnly=yes
+  -o ConnectTimeout=15
+  -o ConnectionAttempts=1
+)
+if [ -n "$SSH_KEY" ]; then
+  SSH_OPTIONS=(-i "$SSH_KEY" "${SSH_OPTIONS[@]}")
+fi
+
+log INFO "Uploading $EXPECTED_SHA to $DEPLOY_HOST"
+scp "${SSH_OPTIONS[@]}" "$ARTIFACT" "$DEPLOY_HOST:$REMOTE_ARTIFACT"
+
+log INFO "Installing release $RELEASE_ID"
+ssh "${SSH_OPTIONS[@]}" "$DEPLOY_HOST" /bin/bash <<EOF
+set -euo pipefail
+
+APP_ROOT=$(escape_shell "$APP_ROOT")
+STATE_ROOT=$(escape_shell "$STATE_ROOT")
+SERVICE_NAME=$(escape_shell "$SERVICE_NAME")
+KEEP_RELEASES=$(escape_shell "$KEEP_RELEASES")
+PYTHON_BIN=$(escape_shell "$PYTHON_BIN")
+RELEASE_ID=$(escape_shell "$RELEASE_ID")
+EXPECTED_SHA=$(escape_shell "$EXPECTED_SHA")
+REMOTE_ARTIFACT=$(escape_shell "$REMOTE_ARTIFACT")
+
+RELEASES_DIR="\$APP_ROOT/releases"
+RELEASE_DIR="\$RELEASES_DIR/\$RELEASE_ID"
+CURRENT_LINK="\$APP_ROOT/current"
+UNIT_PATH="/etc/systemd/system/\$SERVICE_NAME"
+UNIT_BACKUP="\$APP_ROOT/.unit-before-\$RELEASE_ID"
+PREVIOUS_CURRENT=""
+
+mkdir -p "\$RELEASES_DIR" "\$STATE_ROOT/output"
+if [ -L "\$CURRENT_LINK" ]; then
+  PREVIOUS_CURRENT="\$(readlink -f "\$CURRENT_LINK")"
+fi
+if [ -f "\$UNIT_PATH" ]; then
+  cp "\$UNIT_PATH" "\$UNIT_BACKUP"
+fi
+
+rollback() {
+  local exit_code="\$?"
+  if [ "\$exit_code" -eq 0 ]; then
+    return
+  fi
+
+  echo "[ERROR] Deep Parse deploy failed; restoring the previous service release." >&2
+  if [ -n "\$PREVIOUS_CURRENT" ]; then
+    ln -sfn "\$PREVIOUS_CURRENT" "\$CURRENT_LINK"
+  else
+    rm -f "\$CURRENT_LINK"
+  fi
+  if [ -f "\$UNIT_BACKUP" ]; then
+    cp "\$UNIT_BACKUP" "\$UNIT_PATH"
+  fi
+  systemctl daemon-reload || true
+  systemctl restart "\$SERVICE_NAME" || true
+  rm -rf "\$RELEASE_DIR"
+  rm -f "\$REMOTE_ARTIFACT"
+  exit "\$exit_code"
+}
+trap rollback EXIT
+
+mkdir -p "\$RELEASE_DIR"
+tar -xzf "\$REMOTE_ARTIFACT" -C "\$RELEASE_DIR"
+printf '%s\n' "\$EXPECTED_SHA" >"\$RELEASE_DIR/RELEASE_SHA"
+
+id deftpdf >/dev/null 2>&1 || useradd --system --create-home --home-dir "\$APP_ROOT" deftpdf
+chown deftpdf:deftpdf "\$APP_ROOT"
+chown -R deftpdf:deftpdf "\$RELEASE_DIR" "\$STATE_ROOT"
+
+if [ ! -x "\$APP_ROOT/.venv/bin/python" ]; then
+  runuser -u deftpdf -- "\$PYTHON_BIN" -m venv "\$APP_ROOT/.venv"
+fi
+runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install --upgrade pip
+runuser -u deftpdf -- "\$APP_ROOT/.venv/bin/python" -m pip install -r "\$RELEASE_DIR/requirements.txt"
+
+ln -sfn "\$RELEASE_DIR" "\$CURRENT_LINK"
+install -o root -g root -m 0644 "\$RELEASE_DIR/systemd/deftpdf-deep-parse.service" "\$UNIT_PATH"
+systemctl daemon-reload
+systemctl restart "\$SERVICE_NAME"
+
+healthy=0
+for _attempt in \$(seq 1 60); do
+  if health="\$(curl -fsS --max-time 5 http://127.0.0.1:18080/health 2>/dev/null)" \
+    && printf '%s' "\$health" | grep -q '"status":"healthy"' \
+    && printf '%s' "\$health" | grep -q '"persistent_tasks":true'; then
+    healthy=1
+    printf '%s\n' "\$health"
+    break
+  fi
+  sleep 2
+done
+
+if [ "\$healthy" -ne 1 ]; then
+  journalctl -u "\$SERVICE_NAME" -n 100 --no-pager >&2 || true
+  exit 1
+fi
+
+test "\$(cat "\$CURRENT_LINK/RELEASE_SHA")" = "\$EXPECTED_SHA"
+systemctl is-active --quiet "\$SERVICE_NAME"
+
+find "\$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+  | sort -nr \
+  | awk -v keep="\$KEEP_RELEASES" 'NR > keep {sub(/^[^ ]+ /, ""); print}' \
+  | while IFS= read -r old_release; do
+      [ -n "\$old_release" ] || continue
+      [ "\$old_release" = "\$(readlink -f "\$CURRENT_LINK")" ] && continue
+      rm -rf "\$old_release"
+    done
+
+rm -f "\$REMOTE_ARTIFACT" "\$UNIT_BACKUP"
+trap - EXIT
+EOF
+
+log OK "Deployed Deep Parse $EXPECTED_SHA to $DEPLOY_HOST"
