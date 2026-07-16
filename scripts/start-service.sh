@@ -15,8 +15,8 @@ HOST="${DEEP_PARSE_HOST:-127.0.0.1}"
 PORT="${DEEP_PARSE_PORT:-18080}"
 VENV_DIR="${DEEP_PARSE_VENV_DIR:-$ROOT_DIR/.venv}"
 
-if [ ! -x "$VENV_DIR/bin/mineru-api" ]; then
-  echo "mineru-api not found in $VENV_DIR. Run scripts/setup-venv.sh first." >&2
+if [ ! -x "$VENV_DIR/bin/uvicorn" ]; then
+  echo "uvicorn not found in $VENV_DIR. Run scripts/setup-venv.sh first." >&2
   exit 1
 fi
 
@@ -29,6 +29,8 @@ exec env \
   MINERU_API_ENABLE_VLM_PRELOAD="${MINERU_API_ENABLE_VLM_PRELOAD:-false}" \
   MINERU_API_OUTPUT_ROOT="${MINERU_API_OUTPUT_ROOT:-/tmp/deftpdf-deep-parse-output}" \
   MINERU_API_MAX_CONCURRENT_REQUESTS="${MINERU_API_MAX_CONCURRENT_REQUESTS:-1}" \
-  "$VENV_DIR/bin/mineru-api" \
+  "$VENV_DIR/bin/uvicorn" \
+  deftpdf_deep_parse.app:app \
   --host "$HOST" \
-  --port "$PORT"
+  --port "$PORT" \
+  --workers 1

@@ -5,10 +5,13 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/deftpdf-deep-parse
-WorkingDirectory=/opt/deftpdf-deep-parse
-ExecStart=/opt/deftpdf-deep-parse/scripts/start-service.sh
+WorkingDirectory=/opt/deftpdf-deep-parse/current
+ExecStart=/usr/bin/env DEEP_PARSE_VENV_DIR=/opt/deftpdf-deep-parse/current/.venv /opt/deftpdf-deep-parse/current/scripts/start-service.sh
 Restart=always
 RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
 User=deftpdf
 Group=deftpdf
 
