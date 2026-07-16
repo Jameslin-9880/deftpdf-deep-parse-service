@@ -83,6 +83,7 @@ RELEASES_DIR="\$APP_ROOT/releases"
 RELEASE_DIR="\$RELEASES_DIR/\$RELEASE_ID"
 CURRENT_LINK="\$APP_ROOT/current"
 UNIT_PATH="/etc/systemd/system/\$SERVICE_NAME"
+ENV_PATH="/etc/default/deftpdf-deep-parse"
 UNIT_BACKUP="\$APP_ROOT/.unit-before-\$RELEASE_ID"
 PREVIOUS_CURRENT=""
 
@@ -124,6 +125,9 @@ printf '%s\n' "\$EXPECTED_SHA" >"\$RELEASE_DIR/RELEASE_SHA"
 id deftpdf >/dev/null 2>&1 || useradd --system --create-home --home-dir "\$APP_ROOT" deftpdf
 chown deftpdf:deftpdf "\$APP_ROOT"
 chown -R deftpdf:deftpdf "\$RELEASE_DIR" "\$STATE_ROOT"
+if [ ! -f "\$ENV_PATH" ]; then
+  install -o root -g root -m 0600 "\$RELEASE_DIR/.env.example" "\$ENV_PATH"
+fi
 
 if [ ! -x "\$APP_ROOT/.venv/bin/python" ]; then
   runuser -u deftpdf -- "\$PYTHON_BIN" -m venv "\$APP_ROOT/.venv"
