@@ -84,17 +84,21 @@ RELEASE_DIR="\$RELEASES_DIR/\$RELEASE_ID"
 CURRENT_LINK="\$APP_ROOT/current"
 UNIT_PATH="/etc/systemd/system/\$SERVICE_NAME"
 ENV_PATH="/etc/default/deftpdf-deep-parse"
-UNIT_BACKUP="\$APP_ROOT/.unit-before-\$RELEASE_ID"
+UNIT_BACKUP="/run/\${SERVICE_NAME}.before-\$RELEASE_ID"
 PREVIOUS_CURRENT=""
 HAD_UNIT=0
 WAS_ENABLED=0
 
-mkdir -p "\$RELEASES_DIR" "\$STATE_ROOT/output"
+id deftpdf >/dev/null 2>&1 || useradd --system --create-home --home-dir "\$APP_ROOT" deftpdf
+# Deployment control files stay root-owned while the running parser keeps
+# write access only to state and cache data.
+install -d -o root -g root -m 0755 "\$APP_ROOT" "\$RELEASES_DIR"
+install -d -o deftpdf -g deftpdf -m 0700 "\$STATE_ROOT" "\$STATE_ROOT/output"
 if [ -L "\$CURRENT_LINK" ]; then
   PREVIOUS_CURRENT="\$(readlink -f "\$CURRENT_LINK")"
 fi
 if [ -f "\$UNIT_PATH" ]; then
-  cp "\$UNIT_PATH" "\$UNIT_BACKUP"
+  install -o root -g root -m 0600 "\$UNIT_PATH" "\$UNIT_BACKUP"
   HAD_UNIT=1
 fi
 if systemctl is-enabled --quiet "\$SERVICE_NAME" 2>/dev/null; then
@@ -127,7 +131,7 @@ rollback() {
   fi
   systemctl restart "\$SERVICE_NAME" || true
   rm -rf "\$RELEASE_DIR"
-  rm -f "\$REMOTE_ARTIFACT"
+  rm -f "\$REMOTE_ARTIFACT" "\$UNIT_BACKUP"
   exit "\$exit_code"
 }
 trap rollback EXIT
@@ -136,14 +140,17 @@ mkdir -p "\$RELEASE_DIR"
 tar -xzf "\$REMOTE_ARTIFACT" -C "\$RELEASE_DIR"
 printf '%s\n' "\$EXPECTED_SHA" >"\$RELEASE_DIR/RELEASE_SHA"
 
-id deftpdf >/dev/null 2>&1 || useradd --system --create-home --home-dir "\$APP_ROOT" deftpdf
-chown deftpdf:deftpdf "\$APP_ROOT"
-chown -R deftpdf:deftpdf "\$RELEASE_DIR" "\$STATE_ROOT"
+chown -R root:root "\$RELEASE_DIR"
+chmod -R go-w "\$RELEASE_DIR"
+chown -R deftpdf:deftpdf "\$STATE_ROOT"
 if [ ! -f "\$ENV_PATH" ]; then
   install -o root -g root -m 0600 "\$RELEASE_DIR/.env.example" "\$ENV_PATH"
 fi
 
 VENV_DIR="\$RELEASE_DIR/.venv"
+# Build dependencies without granting the service account write access to
+# release source, the current symlink, or the systemd unit source.
+install -d -o deftpdf -g deftpdf -m 0755 "\$VENV_DIR"
 runuser -u deftpdf -- "\$PYTHON_BIN" -m venv "\$VENV_DIR"
 runuser -u deftpdf -- "\$VENV_DIR/bin/python" -m pip install --upgrade pip
 CPU_ONLY="\$(grep -E '^DEEP_PARSE_CPU_ONLY=' "\$ENV_PATH" | tail -n 1 | cut -d= -f2- || true)"
@@ -159,6 +166,9 @@ if printf '%s' "\$CPU_ONLY" | grep -Eiq '^(1|true|yes|on)$'; then
     "torchvision==\$TORCHVISION_VERSION"
 fi
 runuser -u deftpdf -- "\$VENV_DIR/bin/python" -m pip install -r "\$RELEASE_DIR/requirements.txt"
+test "\$(stat -c '%U:%G' "\$APP_ROOT")" = "root:root"
+test "\$(stat -c '%U:%G' "\$RELEASE_DIR")" = "root:root"
+runuser -u deftpdf -- test ! -w "\$RELEASE_DIR/systemd/deftpdf-deep-parse.service"
 
 LEGACY_MODEL_DIR="\$APP_ROOT/.cache/modelscope/hub/models/OpenDataLab/PDF-Extract-Kit-1___0"
 CURRENT_MODEL_PARENT="\$APP_ROOT/.cache/modelscope/models/OpenDataLab--PDF-Extract-Kit-1.0/snapshots"
