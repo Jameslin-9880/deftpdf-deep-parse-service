@@ -33,6 +33,7 @@ This repo does not re-implement MinerU. It provides:
 - Intended backend: `pipeline` CPU mode unless you explicitly provision another backend
 - Task database: `/var/lib/deftpdf-deep-parse/tasks.sqlite3`
 - Default hard task timeout: `7200` seconds
+- Default Linux runtime: CPU-only PyTorch `2.11.0` and torchvision `0.26.0`
 
 `POST /tasks` persists the upload and task metadata before returning `202`.
 `GET /tasks/{task_id}` and `GET /tasks/{task_id}/result` remain usable after
@@ -101,6 +102,8 @@ SSH_KEY=/path/to/id_ed25519 \
 The script refuses a dirty checkout or a SHA mismatch, installs dependencies
 into the shared virtualenv, atomically switches `current`, restarts systemd,
 and rolls back automatically unless `/health` confirms persistent task mode.
+Fresh Linux installs explicitly use PyTorch's CPU wheel index so a CPU parser
+host never downloads CUDA runtime packages by accident.
 
 ## Notes
 
